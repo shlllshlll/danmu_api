@@ -173,13 +173,20 @@ export default class BilibiliSource extends BaseSource {
       }
 
       const results = [];
-      for (const item of data.data.result) {
-        const mediaId = item.season_id ? `ss${item.season_id}` : item.bvid ? `bv${item.bvid}` : "";
+      for (let index = 0; index < data.data.result.length; index++) {
+        const item = data.data.result[index];
+        // 普通投稿视频（search_type=video）没有 season_id，以 bvid 作为媒体 ID；
+        // 极少数条目可能只带 aid，此时用 avid 兜底。
+        const isUgcVideo = searchType === "video" || item.type === "video";
+        const mediaId = isUgcVideo
+          ? (item.bvid ? `bv${item.bvid}` : item.aid ? `av${item.aid}` : "")
+          : (item.season_id ? `ss${item.season_id}` : item.bvid ? `bv${item.bvid}` : "");
         if (!mediaId) continue;
 
         // 提取媒体类型（参考 bilibili.py 和优化后的 youku.js）
-        const mediaType = this._extractMediaType(item.season_type_name);
-        const episodeCount = mediaType === "电影" ? 1 : (item.ep_size || 0);
+        // UGC 视频不属于番剧/影视体系，统一标记为“视频”，避免被误判为电影。
+        const mediaType = isUgcVideo ? "视频" : this._extractMediaType(item.season_type_name);
+        const episodeCount = isUgcVideo ? 0 : (mediaType === "电影" ? 1 : (item.ep_size || 0));
 
         // 提取年份
         let year = null;
@@ -206,6 +213,10 @@ export default class BilibiliSource extends BaseSource {
         const cleanedOrgTitle = decodeHtmlEntities((item.org_title || "").replace(/<[^>]+>/g, ''))
           .trim();
 
+        // 搜索结果封面字段不同：番剧/影视为 cover，普通视频为 pic，且 pic 可能是协议相对地址
+        const rawImage = item.cover || item.pic || null;
+        const imageUrl = typeof rawImage === "string" && rawImage.startsWith("//") ? `https:${rawImage}` : rawImage;
+
         const resultItem = {
           provider: "bilibili",
           mediaId,
@@ -214,12 +225,18 @@ export default class BilibiliSource extends BaseSource {
 		  org_title: cleanedOrgTitle,
           type: mediaType,
           year,
-          imageUrl: item.cover || null,
+          imageUrl,
           episodeCount
         };
 
+        // 普通投稿视频记录来源检索顺序，排序时保留接口相关性顺序
+        if (isUgcVideo) {
+          resultItem._isUgcVideo = true;
+          resultItem._searchIndex = index;
+        }
+
         // 如果搜索结果自带分集信息（Web端特性），挂载到对象上
-        if (item.eps && item.eps.length > 0) {
+        if (!isUgcVideo && item.eps && item.eps.length > 0) {
             resultItem._eps = item.eps;
         }
 
@@ -274,6 +291,23 @@ export default class BilibiliSource extends BaseSource {
     return "电视剧";
   }
 
+  /**
+   * 从搜索词中移除季/集标记，供普通投稿视频做标题兜底匹配。
+   * 普通视频标题通常只有合集名，不含 SxxExx，若不剥离会误杀整个合集。
+   */
+  _stripSeasonEpisodeMarkers(text) {
+    return String(text ?? '')
+      .replace(/\bS\d{1,2}\s*E\d{1,4}\b/gi, ' ')
+      .replace(/\bSeason\s*\d+\b/gi, ' ')
+      .replace(/\bPart\s*\d+\b/gi, ' ')
+      .replace(/第\s*[0-9一二三四五六七八九十百千万]+\s*[季期部]/g, ' ')
+      .replace(/第\s*[0-9一二三四五六七八九十百千万]+\s*[集话回]/g, ' ')
+      .replace(/\bS\d{1,2}\b/gi, ' ')
+      .replace(/\bE[Pp]?\d{1,4}\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
   async search(keyword) {
     let localMatches = [];
     if (globals.useBangumiData) {
@@ -304,8 +338,11 @@ export default class BilibiliSource extends BaseSource {
         t3 = this._searchOversea(keyword, localOverseas.length > 0);
       }
 
+      // 第三种检索方式：普通投稿视频（search_type=video），覆盖番剧/影视库之外的多分P视频
+      const t4 = this._searchByType(keyword, "video", mixinKey);
+
       // 等待所有网络请求完成
-      let networkResults = (await Promise.all([t1, t2, t3])).flat();
+      let networkResults = (await Promise.all([t1, t2, t3, t4])).flat();
 
       const finalResults = [];
       const seenIds = new Set();
@@ -518,10 +555,16 @@ export default class BilibiliSource extends BaseSource {
 
   /**
    * 获取普通视频分集列表
+   * @param {string} id - BV 号（bv...）或 AV 号（av...）
    */
-  async _getUgcEpisodes(bvid) {
+  async _getUgcEpisodes(id) {
     try {
-      const url = `https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`;
+      const isAid = /^av\d+$/i.test(id);
+      const isBvid = /^bv/i.test(id);
+      // 兼容 getEpisodes 传入的 bv.../av... 前缀，也兼容直接传入裸 BV/av 号
+      const videoId = isAid || isBvid ? id.substring(2) : id;
+      const query = isAid ? `aid=${videoId}` : `bvid=${videoId}`;
+      const url = `https://api.bilibili.com/x/web-interface/view?${query}`;
 
       const response = await httpGet(url, {
         headers: {
@@ -534,28 +577,32 @@ export default class BilibiliSource extends BaseSource {
       const data = typeof response.data === "string" ? JSON.parse(response.data) : response.data;
 
       if (data.code !== 0 || !data.data) {
-        log("error", `[bilibili] 获取视频分集失败 (bvid=${bvid}):`, data.message);
+        log("error", `[bilibili] 获取视频分集失败 (${id}):`, data.message);
         return [];
       }
 
       const pages = data.data.pages || [];
 
       if (pages.length === 0) {
-        log("info", `[bilibili] 视频 bvid=${bvid} 无分集数据`);
+        log("info", `[bilibili] 视频 ${id} 无分集数据`);
         return [];
       }
 
+      // 统一使用接口返回的 bvid 构造播放地址，兼容传入 av 号的情况
+      const bvid = data.data.bvid || (isAid ? "" : videoId);
       const episodes = pages.map((page, index) => ({
         vid: `${data.data.aid},${page.cid}`,
         id: page.cid,
         title: (page.part || `P${page.page}`).trim(),
-        link: `https://www.bilibili.com/video/${bvid}?p=${page.page}`
+        link: bvid
+          ? `https://www.bilibili.com/video/${bvid}?p=${page.page}`
+          : `https://www.bilibili.com/video/av${data.data.aid}?p=${page.page}`
       }));
 
       log("info", `[bilibili] 获取到 ${episodes.length} 个视频分集`);
       return episodes;
     } catch (error) {
-      log("error", `[bilibili] 获取视频分集出错 (bvid=${bvid}):`, error.message);
+      log("error", `[bilibili] 获取视频分集出错 (${id}):`, error.message);
       return [];
     }
   }
@@ -575,9 +622,8 @@ export default class BilibiliSource extends BaseSource {
     if (id.startsWith('ss')) {
       const seasonId = id.substring(2);
       return await this._getPgcEpisodes(seasonId);
-    } else if (id.startsWith('bv')) {
-      const bvid = id.substring(2);
-      return await this._getUgcEpisodes(bvid);
+    } else if (id.startsWith('bv') || id.startsWith('av')) {
+      return await this._getUgcEpisodes(id);
     }
 
     log("error", `[bilibili] 不支持的 ID 格式: ${id}`);
@@ -618,14 +664,22 @@ export default class BilibiliSource extends BaseSource {
 
     // 基础标题与季度匹配过滤
     // 港澳台资源不做严格标题匹配，其他资源根据当前标题或别名池（已包含原标题和 org_title）验证查询匹配度
-    let filteredAnimes = sourceAnimes.filter(anime => 
-        anime.isOversea || 
-        titleMatches(anime.title, queryTitle, querySeason) || 
-        (anime.aliases && anime.aliases.some(alias => titleMatches(alias, queryTitle, querySeason)))
-    );
-
-    // 提取搜索词中的明确季度信息或使用传入的季度参数
     const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+    const ugcFallbackQuery = this._stripSeasonEpisodeMarkers(queryTitle);
+    const canUseUgcFallback = ugcFallbackQuery && ugcFallbackQuery !== queryTitle;
+
+    let filteredAnimes = sourceAnimes.filter(anime => {
+        if (anime.isOversea) return true;
+
+        const matchesQuery = (query, season) =>
+            titleMatches(anime.title, query, season) ||
+            (anime.aliases && anime.aliases.some(alias => titleMatches(alias, query, season)));
+
+        if (matchesQuery(queryTitle, querySeason)) return true;
+
+        // 普通投稿视频标题往往只有合集名；允许剥离 SxxExx/第x季 后再匹配一次
+        return !!(anime._isUgcVideo && canUseUgcFallback && matchesQuery(ugcFallbackQuery, resolvedQuerySeason));
+    });
 
     // 初始列表预过滤机制：若用户指定了季度，优先检查结果中是否已包含匹配项
     if (resolvedQuerySeason !== null) {
@@ -697,10 +751,15 @@ export default class BilibiliSource extends BaseSource {
              }
              // 使用详情接口返回的番剧主封面填充搜索结果未提供的 imageUrl
              if (eps._cover) anime.imageUrl = eps._cover;
+             // 普通投稿视频的链接已带 ?p=N，不能再拼 season_id；只有番剧/影视需要补充季参数
+             const isUgcMedia = anime._isUgcVideo || /^(bv|av)/i.test(anime.mediaId);
              links = eps.map((ep, index) => {
-                let linkUrl = ep.link + `?season_id=${anime.mediaId.substring(2)}`;
+                let linkUrl = ep.link;
+                if (!isUgcMedia) {
+                    linkUrl += `${linkUrl.includes('?') ? '&' : '?'}season_id=${anime.mediaId.substring(2)}`;
+                }
                 // 传递区域标记
-                if (anime.isOversea) linkUrl += "&area=hkmt";
+                if (anime.isOversea) linkUrl += `${linkUrl.includes('?') ? '&' : '?'}area=hkmt`;
                 return {
                     name: `${index + 1}`,
                     url: linkUrl,
@@ -732,7 +791,10 @@ export default class BilibiliSource extends BaseSource {
             rating: 0,
             isFavorited: true,
             source: "bilibili",
-            aliases: anime.aliases 
+            aliases: anime.aliases,
+            // 普通投稿视频作为第三种检索方式，排在番剧/影视结果之后，并保留搜索接口的相关性顺序
+            _isUgcVideo: !!anime._isUgcVideo,
+            _searchIndex: anime._searchIndex ?? null
           };
 
           tmpAnimes.push(transformedAnime);
@@ -748,7 +810,20 @@ export default class BilibiliSource extends BaseSource {
 
     await Promise.all(processPromises);
 
-    this.sortAndPushAnimesByYear(tmpAnimes, curAnimes);
+    // 番剧/影视沿用原有的年份排序；普通投稿视频统一排在其后，内部保持搜索接口返回顺序，
+    // 这样第三种检索方式不会抢占前两种方式的结果。
+    const regularAnimes = tmpAnimes.filter(anime => !anime._isUgcVideo);
+    const ugcVideoAnimes = tmpAnimes
+      .filter(anime => anime._isUgcVideo)
+      .sort((a, b) => (a._searchIndex ?? 0) - (b._searchIndex ?? 0));
+
+    this.sortAndPushAnimesByYear(regularAnimes, curAnimes);
+    for (const anime of ugcVideoAnimes) {
+      if (!curAnimes.some(existing => existing.animeId === anime.animeId)) {
+        curAnimes.push(anime);
+      }
+    }
+
     return tmpAnimes;
   }
 

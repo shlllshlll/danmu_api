@@ -100,6 +100,7 @@ LogVar 弹幕 API 服务器
   - 本地和Docker部署支持实时保存缓存到文件（挂载.cache目录即可）
 - **部署支持**：支持本地运行、Docker 容器化、Vercel 一键部署、Netlify 一键部署、EdgeOne Makers 一键部署、Cloudflare 一键部署、Hugging Face Spaces部署和 Docker 一键启动。
 - **手动选择记忆**：支持记住之前搜索title时手动选择的anime，并在后续的match自动匹配时优选该anime，支持记住集episode，下次自动匹配时会对集进行偏移【实验性】。
+- **B站普通投稿视频（含多分P）支持**：B站源在原有番剧（`media_bangumi`）和影视（`media_ft`）之外，新增第三种检索方式 `type=video`，可检索普通投稿视频；多分P视频会按分P标题生成剧集并逐P获取弹幕，不再局限于番剧/影视库。另提供 `scripts/bilibili-danmaku-download.mjs` 命令行脚本，可将指定B站视频的全部分P弹幕导出为按分P名命名的 XML。
 - **手动搜索支持输入播放链接获取弹幕**：支持手动搜索的播放器输入爱优腾芒哔咪狐乐西埋巴Ani红播放链接可获取弹幕，如`senplayer`。
   - 支持空格分隔多个链接合并弹幕，例如：`https://www.iqiyi.com/v_xxx.html https://v.qq.com/x/cover/xxx.html`
   - 支持链接尾部追加时间偏移，例如：`https://www.iqiyi.com/v_xxx.html@-50`（提前50秒）、`https://v.qq.com/x/cover/xxx.html@%11`（百分比缩放）
@@ -198,6 +199,26 @@ LogVar 弹幕 API 服务器
    - `POST http://{ip}:9321/87654321/api/v2/segmentcomment?format=json` (请求体包含segment类JSON数据，示例 `{"type": "qq","segment_start":0,"segment_end":30000,"url":"https://dm.video.qq.com/barrage/segment/j0032ubhl9s/t/v1/0/30000"}` )
    - `GET http://{ip}:9321/87654321/api/logs`
    > 注意：TOKEN为默认87654321的情况下，可不带{TOKEN}请求，如`http://{ip}:9321/api/v2/search/anime?keyword=生万物`
+
+### B站弹幕下载脚本
+
+需要把某个 B 站视频（支持多分P）的全部弹幕导出为 XML 时，可直接使用命令行脚本：
+
+```bash
+# Cookie 优先读取 --cookie，其次 BILIBILI_COOKIE，也会自动加载 config/.env
+export BILIBILI_COOKIE='SESSDATA=...; bili_jct=...'
+
+# 下载全部分P
+node scripts/bilibili-danmaku-download.mjs https://www.bilibili.com/video/av117227776903200
+
+# 也可以使用 npm 脚本，并只下载指定分P
+npm run download:bilibili-danmaku -- BV1JMbw62E72 -o ./danmaku --pages 1-3,5
+```
+
+- 支持完整视频链接、`BV` 号、`av` 号和纯数字 aid。
+- 默认输出到 `.cache/bilibili_danmaku/<标题>_<BV号>/`，每个分P一个 XML，文件名取分P标题；同时生成 `_meta.json`（包含 cid、时长、分片数、弹幕数）。
+- `--pages` 支持 `1,3-5` 形式；`--concurrency` 控制分片并发数（1-8，默认 4）；`--no-meta` 不生成清单。
+- 导出的是 B 站标准 `<i><d p="...">` XML，可直接用于本地弹幕或后续手动处理。
 
 ### Forward 真机调试
 
@@ -657,6 +678,8 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 │       ├── sync_fork.yml        # Fork 仓库自动同步
 │       └── sync_hf.yml          # Hugging Face Space 同步
 ├── build-forward-widget.js     # 构建forward弹幕插件脚本
+├── scripts/
+│   └── bilibili-danmaku-download.mjs # 下载指定B站视频全部分P弹幕为XML
 ├── Dockerfile
 ├── edgeone.json                # EdgeOne Makers 配置文件
 ├── LICENSE
